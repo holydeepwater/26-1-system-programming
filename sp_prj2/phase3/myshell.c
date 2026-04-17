@@ -1,25 +1,20 @@
 #include "myshell.h"
+#include <ctype.h>
 
 static job_t jobs[MAXJOBS];
 static int next_jid = 1;
 static volatile sig_atomic_t fg_pgid = 0;
 
+static char *trim_ws(char *s);
+static void normalize_jobcmd(char *cmdline);
 static void init_jobs(void);
 static void install_signal_handlers(void);
-static void sigchld_handler(int sig);
-static void sigint_handler(int sig);
-static void sigtstp_handler(int sig);
-
-static char *find_pipe(char *buf);
-static int parse_command(char *cmd, char **argv);
-static int split_pipeline(char *cmdline, char **segments);
-static int parse_line(char *buf, char **segments, int *bg);
-static void normalize_jobcmd(char *jobcmd);
-static int launch_pipeline(char **segments, int nseg, int bg, const char *cmdline);
-
-static sigset_t chld_mask(void);
 static void block_sigchld(sigset_t *prev);
 static void restore_sigmask(const sigset_t *prev);
+
+static int parseline(char *buf, char **argv);
+static int parse_line(char *buf, char **segments, int *nseg, int *bg);
+static int launch_pipeline(char **segments, int nseg, int bg, const char *cmdline);
 
 static job_t *add_job(pid_t pgid, pid_t *pids, int npids, job_state_t state,
                       const char *cmdline);
@@ -36,30 +31,28 @@ static int builtin_fg(char **argv);
 static int builtin_kill(char **argv);
 static void wait_for_foreground(pid_t pgid);
 
+static void sigchld_handler(int sig);
+static void sigint_handler(int sig);
+static void sigtstp_handler(int sig);
+
 int main(void) {
     char cmdline[MAXLINE];
-
     init_jobs();
     install_signal_handlers();
-
     while (1) {
         printf("CSE4100-SP-P3> ");
         fflush(stdout);
-
         if (fgets(cmdline, MAXLINE, stdin) == NULL) {
             if (feof(stdin)) {
                 putchar('\n');
                 exit(0);
             }
-
             if (errno == EINTR) {
                 clearerr(stdin);
                 continue;
             }
-
             continue;
         }
-
         eval(cmdline);
     }
 }
@@ -69,38 +62,29 @@ void eval(char *cmdline) {
     char jobcmd[MAXLINE];
     char *segments[MAXCMDS];
     int bg = 0;
-    int nseg;
+    int nseg = 0;
 
     strcpy(buf, cmdline);
-    buf[strcspn(buf, "\n")] = '\0';
-
-    if (buf[0] == '\0') {
-        return;
-    }
-
-    strncpy(jobcmd, buf, MAXLINE - 1);
-    jobcmd[MAXLINE - 1] = '\0';
+    strcpy(jobcmd, cmdline);
     normalize_jobcmd(jobcmd);
 
-    nseg = parse_line(buf, segments, &bg);
-    if (nseg <= 0) {
+    if (parse_line(buf, segments, &nseg, &bg) < 0) {
+        fprintf(stderr, "parse error\n");
         return;
     }
 
+    if (nseg == 0) return;
+    
     if (nseg == 1) {
-        char builtin_buf[MAXLINE];
+        char onecmd[MAXLINE];
         char *argv[MAXARGS];
 
-        strncpy(builtin_buf, segments[0], MAXLINE - 1);
-        builtin_buf[MAXLINE - 1] = '\0';
-        parse_command(builtin_buf, argv);
-        if (argv[0] == NULL) {
-            return;
-        }
+        strcpy(onecmd, segments[0]);
+        parseline(onecmd, argv);
+        if (argv[0] == NULL) return;
+    
 
-        if (builtin_command(argv)) {
-            return;
-        }
+        if (builtin_command(argv)) return;
     }
 
     launch_pipeline(segments, nseg, bg, jobcmd);
@@ -120,26 +104,19 @@ int builtin_command(char **argv) {
         return 1;
     }
 
-    if (!strcmp(argv[0], "exit")) {
-        exit(0);
-    }
+    if (!strcmp(argv[0], "exit")) exit(0);
 
     if (!strcmp(argv[0], "jobs")) {
         list_jobs();
         return 1;
     }
 
-    if (!strcmp(argv[0], "bg")) {
-        return builtin_bg(argv);
-    }
+    if (!strcmp(argv[0], "bg")) return builtin_bg(argv);
 
-    if (!strcmp(argv[0], "fg")) {
-        return builtin_fg(argv);
-    }
 
-    if (!strcmp(argv[0], "kill")) {
-        return builtin_kill(argv);
-    }
+    if (!strcmp(argv[0], "fg")) return builtin_fg(argv);
+
+    if (!strcmp(argv[0], "kill")) return builtin_kill(argv);
 
     return 0;
 }
@@ -147,27 +124,22 @@ int builtin_command(char **argv) {
 pid_t Fork(void) {
     pid_t pid;
 
-    if ((pid = fork()) < 0) {
-        unix_error("fork");
-    }
+    if ((pid = fork()) < 0) unix_error("fork");
 
     return pid;
 }
 
 void Execvp(const char *file, char *const argv[]) {
     if (execvp(file, argv) < 0) {
-        fprintf(stderr, "%s: Command not found\n", file);
-        _exit(1);
+        unix_error("Execvp error");
     }
 }
 
 pid_t Waitpid(pid_t pid, int *iptr, int options) {
     pid_t retpid;
-
     if ((retpid = waitpid(pid, iptr, options)) < 0 && errno != ECHILD) {
         unix_error("waitpid");
     }
-
     return retpid;
 }
 
@@ -176,8 +148,39 @@ int Pipe(int fd[2]) {
         unix_error("pipe");
         return -1;
     }
-
     return 0;
+}
+
+static char *trim_ws(char *s) {
+    char *end;
+    while (*s && isspace((unsigned char)*s)) s++;
+
+    if (*s == '\0') return s;
+
+    end = s + strlen(s) - 1;
+    while (end > s && isspace((unsigned char)*end)) {
+        *end = '\0';
+        end--;
+    }
+    return s;
+}
+
+static void normalize_jobcmd(char *cmdline) {
+    char *s;
+    char *end;
+
+    cmdline[strcspn(cmdline, "\n")] = '\0';
+    s = trim_ws(cmdline);
+    if (s != cmdline) memmove(cmdline, s, strlen(s) + 1);
+
+    if (cmdline[0] == '\0') return;
+
+    end = cmdline + strlen(cmdline) - 1;
+    if (*end == '&') {
+        *end = '\0';
+        s = trim_ws(cmdline);
+        if (s != cmdline) memmove(cmdline, s, strlen(s) + 1);
+    }
 }
 
 static void init_jobs(void) {
@@ -203,176 +206,120 @@ static void install_signal_handlers(void) {
     signal(SIGQUIT, SIG_IGN);
 }
 
-static char *find_pipe(char *buf) {
-    char *p = buf;
-    char quote = 0;
+static void block_sigchld(sigset_t *prev) {
+    sigset_t mask;
 
-    while (*p != '\0') {
-        if (quote == 0 && (*p == '"' || *p == '\'')) {
-            quote = *p;
-        } else if (quote != 0 && *p == quote) {
-            quote = 0;
-        } else if (quote == 0 && *p == '|') {
-            return p;
-        }
-        p++;
-    }
-
-    return NULL;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
+    sigprocmask(SIG_BLOCK, &mask, prev);
 }
 
-static int parse_command(char *cmd, char **argv) {
+static void restore_sigmask(const sigset_t *prev) {
+    sigprocmask(SIG_SETMASK, prev, NULL);
+}
+
+static int parseline(char *buf, char **argv) {
     int argc = 0;
-    char *p = cmd;
+    char *p = buf;
 
-    while (*p != '\0') {
-        while (*p == ' ' || *p == '\t' || *p == '\n') {
-            p++;
-        }
+    buf[strcspn(buf, "\n")] = '\0';
 
-        if (*p == '\0') {
-            break;
-        }
+    while (*p) {
+        while (*p && isspace((unsigned char)*p)) p++;
+
+        if (!*p) break;
 
         if (*p == '"' || *p == '\'') {
             char quote = *p++;
             argv[argc++] = p;
+            while (*p && *p != quote) p++;
+            if (*p == quote) *p++ = '\0';
 
-            while (*p != '\0' && *p != quote) {
-                p++;
-            }
-        } else {
+        } 
+        else {
             argv[argc++] = p;
-
-            while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n') {
-                p++;
-            }
+            while (*p && !isspace((unsigned char)*p)) p++;
+            if (*p) *p++ = '\0';
         }
 
-        if (*p != '\0') {
-            *p++ = '\0';
-        }
-
-        if (argc >= MAXARGS - 1) {
-            break;
-        }
+        if (argc >= MAXARGS - 1) break;
     }
 
     argv[argc] = NULL;
     return argc;
 }
 
-static int split_pipeline(char *cmdline, char **segments) {
-    int nseg = 0;
-    char *start = cmdline;
-    char *pipe_pos;
-
-    while (start != NULL && *start != '\0' && nseg < MAXCMDS) {
-        while (*start == ' ' || *start == '\t') {
-            start++;
-        }
-
-        pipe_pos = find_pipe(start);
-        if (pipe_pos != NULL) {
-            *pipe_pos = '\0';
-        }
-
-        segments[nseg++] = start;
-        start = (pipe_pos == NULL) ? NULL : pipe_pos + 1;
-    }
-
-    return nseg;
-}
-
-static int parse_line(char *buf, char **segments, int *bg) {
-    char quote = 0;
-    char *amp = NULL;
+static int parse_line(char *buf, char **segments, int *nseg, int *bg) {
+    int in_single = 0;
+    int in_double = 0;
     char *p;
+    char *start;
 
+    buf[strcspn(buf, "\n")] = '\0';
+    *nseg = 0;
     *bg = 0;
+    start = buf;
 
-    for (p = buf; *p != '\0'; p++) {
-        if (quote == 0 && (*p == '"' || *p == '\'')) {
-            quote = *p;
-        } else if (quote != 0 && *p == quote) {
-            quote = 0;
-        } else if (quote == 0 && *p == '&') {
-            amp = p;
+    for (p = buf; *p; p++) {
+        if (*p == '\'' && !in_double) {
+            in_single = !in_single;
+            continue;
         }
-    }
-
-    if (amp != NULL) {
-        char *tail = amp + 1;
-
-        while (*tail == ' ' || *tail == '\t') {
-            tail++;
+        if (*p == '"' && !in_single) {
+            in_double = !in_double;
+            continue;
         }
 
-        if (*tail == '\0') {
-            *bg = 1;
-            *amp = '\0';
-        }
-    }
-
-    if (buf[0] != '\0') {
-        for (p = buf + strlen(buf) - 1; p >= buf && (*p == ' ' || *p == '\t'); p--) {
+        if (!in_single && !in_double && *p == '|') {
             *p = '\0';
+            segments[*nseg] = trim_ws(start);
+            if (segments[*nseg][0] == '\0' || strchr(segments[*nseg], '&') != NULL) {
+                return -1;
+            }
+            (*nseg)++;
+            if (*nseg >= MAXCMDS) {
+                return -1;
+            }
+            start = p + 1;
         }
     }
 
-    if (buf[0] == '\0') {
-        return 0;
+    start = trim_ws(start);
+    if (*start == '\0') return (*nseg == 0) ? 0 : -1;
+    p = start + strlen(start) - 1;
+    if (*p == '&') {
+        *p = '\0';
+        *bg = 1;
+        start = trim_ws(start);
+        if (*start == '\0') return -1;
     }
 
-    return split_pipeline(buf, segments);
-}
+    if (strchr(start, '&') != NULL) return -1;
 
-static void normalize_jobcmd(char *jobcmd) {
-    char *p;
 
-    if (jobcmd[0] != '\0') {
-        for (p = jobcmd + strlen(jobcmd) - 1;
-             p >= jobcmd && (*p == ' ' || *p == '\t');
-             p--) {
-            *p = '\0';
-        }
-    }
-
-    if (jobcmd[0] != '\0') {
-        p = jobcmd + strlen(jobcmd) - 1;
-        if (*p == '&') {
-            *p = '\0';
-        }
-    }
-
-    if (jobcmd[0] != '\0') {
-        for (p = jobcmd + strlen(jobcmd) - 1;
-             p >= jobcmd && (*p == ' ' || *p == '\t');
-             p--) {
-            *p = '\0';
-        }
-    }
+    segments[*nseg] = start;
+    (*nseg)++;
+    return 0;
 }
 
 static int launch_pipeline(char **segments, int nseg, int bg, const char *cmdline) {
-    int i;
-    int in_fd = STDIN_FILENO;
-    int fd[2] = {-1, -1};
+    int prev_read = -1;
     pid_t pids[MAXCMDS];
     pid_t pgid = 0;
     sigset_t prev;
     job_t *job;
+    int i;
 
     block_sigchld(&prev);
 
     for (i = 0; i < nseg; i++) {
+        int fd[2] = {-1, -1};
         char *argv[MAXARGS];
         pid_t pid;
 
-        parse_command(segments[i], argv);
-        if (argv[0] == NULL) {
-            continue;
-        }
+        parseline(segments[i], argv);
+        if (argv[0] == NULL) continue;
+
 
         if (i < nseg - 1 && Pipe(fd) < 0) {
             restore_sigmask(&prev);
@@ -383,18 +330,17 @@ static int launch_pipeline(char **segments, int nseg, int bg, const char *cmdlin
         if (pid == 0) {
             restore_sigmask(&prev);
 
-            if (pgid == 0) {
-                pgid = getpid();
-            }
+            if (pgid == 0) pgid = getpid();
+
             setpgid(0, pgid);
 
-            if (in_fd != STDIN_FILENO) {
-                dup2(in_fd, STDIN_FILENO);
-                close(in_fd);
-            }
+            if (prev_read != -1) dup2(prev_read, STDIN_FILENO);
+            if (i < nseg - 1) dup2(fd[1], STDOUT_FILENO);
+
+
+            if (prev_read != -1) close(prev_read);
 
             if (i < nseg - 1) {
-                dup2(fd[1], STDOUT_FILENO);
                 close(fd[0]);
                 close(fd[1]);
             }
@@ -402,59 +348,37 @@ static int launch_pipeline(char **segments, int nseg, int bg, const char *cmdlin
             Execvp(argv[0], argv);
         }
 
-        if (pgid == 0) {
-            pgid = pid;
-        }
+        if (pgid == 0) pgid = pid;
         setpgid(pid, pgid);
         pids[i] = pid;
 
-        if (in_fd != STDIN_FILENO) {
-            close(in_fd);
-        }
+        if (prev_read != -1) close(prev_read);
 
         if (i < nseg - 1) {
             close(fd[1]);
-            in_fd = fd[0];
-        }
+            prev_read = fd[0];
+        } 
+        else prev_read = -1;
     }
 
-    if (in_fd != STDIN_FILENO) {
-        close(in_fd);
-    }
+    if (prev_read != -1) close(prev_read);
+
 
     job = add_job(pgid, pids, nseg, bg ? JOB_BACKGROUND : JOB_FOREGROUND, cmdline);
     restore_sigmask(&prev);
 
     if (job == NULL) {
         fprintf(stderr, "job table is full\n");
-        kill(-pgid, SIGKILL);
+        if (pgid > 0) kill(-pgid, SIGKILL);
+
         return -1;
     }
 
-    if (bg) {
-        printf("[%d] %d %s\n", job->jid, job->pgid, job->cmdline);
-    } else {
-        wait_for_foreground(pgid);
-    }
+    if (bg) printf("[%d] %d %s\n", job->jid, job->pgid, job->cmdline);
+
+    else wait_for_foreground(pgid);
 
     return 0;
-}
-
-static sigset_t chld_mask(void) {
-    sigset_t mask;
-
-    sigemptyset(&mask);
-    sigaddset(&mask, SIGCHLD);
-    return mask;
-}
-
-static void block_sigchld(sigset_t *prev) {
-    sigset_t mask = chld_mask();
-    sigprocmask(SIG_BLOCK, &mask, prev);
-}
-
-static void restore_sigmask(const sigset_t *prev) {
-    sigprocmask(SIG_SETMASK, prev, NULL);
 }
 
 static job_t *add_job(pid_t pgid, pid_t *pids, int npids, job_state_t state,
@@ -469,9 +393,9 @@ static job_t *add_job(pid_t pgid, pid_t *pids, int npids, job_state_t state,
             jobs[i].npids = npids;
             jobs[i].live_count = npids;
             jobs[i].state = state;
+            memcpy(jobs[i].pids, pids, sizeof(pid_t) * npids);
             strncpy(jobs[i].cmdline, cmdline, MAXLINE - 1);
             jobs[i].cmdline[MAXLINE - 1] = '\0';
-            memcpy(jobs[i].pids, pids, sizeof(pid_t) * npids);
             update_fg_pgid();
             return &jobs[i];
         }
@@ -481,9 +405,7 @@ static job_t *add_job(pid_t pgid, pid_t *pids, int npids, job_state_t state,
 }
 
 static void delete_job(job_t *job) {
-    if (job == NULL) {
-        return;
-    }
+    if (job == NULL) return;
 
     memset(job, 0, sizeof(*job));
     update_fg_pgid();
@@ -493,11 +415,8 @@ static job_t *find_job_by_jid(int jid) {
     int i;
 
     for (i = 0; i < MAXJOBS; i++) {
-        if (jobs[i].used && jobs[i].jid == jid) {
-            return &jobs[i];
-        }
+        if (jobs[i].used && jobs[i].jid == jid) return &jobs[i];
     }
-
     return NULL;
 }
 
@@ -506,17 +425,12 @@ static job_t *find_job_by_pid(pid_t pid) {
     int j;
 
     for (i = 0; i < MAXJOBS; i++) {
-        if (!jobs[i].used) {
-            continue;
-        }
+        if (!jobs[i].used) continue;
 
         for (j = 0; j < jobs[i].npids; j++) {
-            if (jobs[i].pids[j] == pid) {
-                return &jobs[i];
-            }
+            if (jobs[i].pids[j] == pid) return &jobs[i];
         }
     }
-
     return NULL;
 }
 
@@ -524,16 +438,14 @@ static job_t *find_foreground_job(void) {
     int i;
 
     for (i = 0; i < MAXJOBS; i++) {
-        if (jobs[i].used && jobs[i].state == JOB_FOREGROUND) {
-            return &jobs[i];
-        }
+        if (jobs[i].used && jobs[i].state == JOB_FOREGROUND) return &jobs[i];
     }
-
     return NULL;
 }
 
 static void update_fg_pgid(void) {
     job_t *job = find_foreground_job();
+
     fg_pgid = (job == NULL) ? 0 : job->pgid;
 }
 
@@ -555,14 +467,12 @@ static void list_jobs(void) {
     int i;
 
     block_sigchld(&prev);
-
     for (i = 0; i < MAXJOBS; i++) {
         if (jobs[i].used) {
             printf("[%d] %-10s %s\n", jobs[i].jid, job_state_name(jobs[i].state),
                    jobs[i].cmdline);
         }
     }
-
     restore_sigmask(&prev);
 }
 
@@ -579,7 +489,6 @@ static int parse_job_id(const char *arg, int *jid) {
         fprintf(stderr, "invalid job id: %s\n", arg);
         return -1;
     }
-
     return 0;
 }
 
@@ -604,12 +513,9 @@ static int builtin_bg(char **argv) {
     update_fg_pgid();
     restore_sigmask(&prev);
 
-    if (kill(-job->pgid, SIGCONT) < 0) {
-        perror("bg");
-    } else {
-        printf("[%d] %d %s\n", job->jid, job->pgid, job->cmdline);
-    }
-
+    if (kill(-job->pgid, SIGCONT) < 0) perror("bg");
+    else printf("[%d] %d %s\n", job->jid, job->pgid, job->cmdline);
+    
     return 1;
 }
 
@@ -619,9 +525,7 @@ static int builtin_fg(char **argv) {
     pid_t pgid;
     int jid;
 
-    if (parse_job_id(argv[1], &jid) < 0) {
-        return 1;
-    }
+    if (parse_job_id(argv[1], &jid) < 0) return 1;
 
     block_sigchld(&prev);
     job = find_job_by_jid(jid);
@@ -650,9 +554,7 @@ static int builtin_kill(char **argv) {
     job_t *job;
     int jid;
 
-    if (parse_job_id(argv[1], &jid) < 0) {
-        return 1;
-    }
+    if (parse_job_id(argv[1], &jid) < 0) return 1;
 
     block_sigchld(&prev);
     job = find_job_by_jid(jid);
@@ -663,10 +565,7 @@ static int builtin_kill(char **argv) {
         return 1;
     }
 
-    if (kill(-job->pgid, SIGTERM) < 0) {
-        perror("kill");
-    }
-
+    if (kill(-job->pgid, SIGTERM) < 0) perror("kill");
     return 1;
 }
 
@@ -674,9 +573,7 @@ static void wait_for_foreground(pid_t pgid) {
     sigset_t empty;
 
     sigemptyset(&empty);
-    while (fg_pgid == pgid) {
-        sigsuspend(&empty);
-    }
+    while (fg_pgid == pgid) sigsuspend(&empty);
 }
 
 static void sigchld_handler(int sig) {
@@ -689,17 +586,17 @@ static void sigchld_handler(int sig) {
     while ((pid = waitpid(-1, &status, WNOHANG | WUNTRACED | WCONTINUED)) > 0) {
         job_t *job = find_job_by_pid(pid);
 
-        if (job == NULL) {
-            continue;
-        }
+        if (job == NULL) continue;
 
         if (WIFSTOPPED(status)) {
             job->state = JOB_STOPPED;
-        } else if (WIFCONTINUED(status)) {
+        } 
+        else if (WIFCONTINUED(status)) {
             if (job->state == JOB_STOPPED) {
                 job->state = JOB_BACKGROUND;
             }
-        } else if (WIFSIGNALED(status) || WIFEXITED(status)) {
+        } 
+        else if (WIFSIGNALED(status) || WIFEXITED(status)) {
             if (job->live_count > 0) {
                 job->live_count--;
             }
