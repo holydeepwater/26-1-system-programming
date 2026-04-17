@@ -15,12 +15,13 @@ the output of one command becomes the input of the next command.
 
 ## How It Works
 - `eval()` checks whether the command line contains a pipe.
-- A normal command is parsed with `parse_command()` and executed with `fork()`.
+- A normal command is parsed with `parseline()` and executed with `fork()`.
 - A piped command is executed by `run_pipe()`.
 - `run_pipe()` recursively splits the command line at `|`, creates pipes with
   `pipe()`, redirects standard input/output with `dup2()`, and runs each stage
-  in a separate process.
-- The parent waits for all child processes created for the pipeline.
+  in a separate child process.
+- The parent process closes unused pipe ends and waits for the pipeline child
+  processes to finish.
 
 ## Build
 ```bash
@@ -34,13 +35,17 @@ make
 
 ## Example Commands
 ```bash
-ls -al | grep myshell
-cat myshell.c | grep "execvp"
-cat myshell.c | grep -i "abc" | sort -r
-printf "a\nb\n" | grep b
+ls | grep myshell
+cat myshell.c | grep "run_pipe"
+cat myshell.c | grep -i "pipe" | sort -r
+ls | grep .c | sort
+cat myshell.c | grep -i "cd"
+echo "hello world" | grep world
 ```
 
 ## Notes
 - Redirection (`<`, `>`) is not implemented in this phase.
 - Background execution (`&`) is not implemented in this phase.
-- Built-in commands inside a pipeline are treated like normal external commands.
+- Quoted arguments are supported for single and double quotes.
+- Built-in commands inside a pipeline are executed in child processes,
+  so `cd` inside a pipeline does not change the parent shell directory.
