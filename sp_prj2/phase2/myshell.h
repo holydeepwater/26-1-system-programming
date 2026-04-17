@@ -25,5 +25,7 @@ pid_t Fork(void);
 void Execvp(const char *file, char *const argv[]);
 pid_t Waitpid(pid_t pid, int *iptr, int options);
 int Pipe(int fd[2]);
+int parseline(char *buf, char **argv);
+void run_pipe(char **cmds, int num_cmds);
 
 #endif

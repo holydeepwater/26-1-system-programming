@@ -1,54 +1,38 @@
 #include "myshell.h"
+#include <ctype.h>
 
-static char *find_pipe(char *buf);
-static int parse_command(char *cmd, char **argv);
-static pid_t run_pipe(char *cmdline, int in_fd, pid_t *pids, int *nchild);
-
-int main(void) {
+int main(void){
     char cmdline[MAXLINE];
-
     while (1) {
         printf("CSE4100-SP-P2> ");
-        fflush(stdout);
-
-        if (fgets(cmdline, MAXLINE, stdin) == NULL) {
-            if (feof(stdin)) exit(0);
-            continue;
-        }
-
+        fgets(cmdline, MAXLINE, stdin);
+        if (feof(stdin)) exit(0);
         eval(cmdline);
     }
 }
+ 
 
-void eval(char *cmdline) {
+void eval(char* cmdline){
     char buf[MAXLINE];
-    char *argv[MAXARGS];
-    pid_t pid;
-
     strcpy(buf, cmdline);
-    buf[strcspn(buf, "\n")] = '\0';
-
-    if (buf[0] == '\0') return;
-
-    if (find_pipe(buf) != NULL) {
-        pid_t pids[MAXCMDS];
-        int nchild = 0;
-
-        run_pipe(buf, STDIN_FILENO, pids, &nchild);
-
-        for (int i = 0; i < nchild; i++) {
-            Waitpid(pids[i], NULL, 0);
+    
+    if (strchr(buf, '|') != NULL) {
+        char* cmds[MAXCMDS];
+        int num_cmds = 0;
+        char* token = strtok(buf, "|");
+        while (token != NULL && num_cmds < MAXCMDS) {
+            cmds[num_cmds++] = token;
+            token = strtok(NULL, "|");
         }
+        run_pipe(cmds, num_cmds);
         return;
     }
-
-    parse_command(buf, argv);
-
+    char *argv[MAXARGS];
+    parseline(buf, argv);
     if (argv[0] == NULL) return;
-
     if (!builtin_command(argv)) {
-        pid = Fork();
-        if (pid == 0) {
+        pid_t pid = Fork();
+        if (pid == 0){
             Execvp(argv[0], argv);
             exit(1);
         }
@@ -56,44 +40,67 @@ void eval(char *cmdline) {
     }
 }
 
-void unix_error(const char *msg) {
+void unix_error(const char* msg){
     fprintf(stderr, "%s: %s\n", msg, strerror(errno));
 }
 
-int builtin_command(char **argv) {
-    if (!strcmp(argv[0], "cd")) {
+int builtin_command(char** argv){
+    if (!strcmp(argv[0], "cd")){ // parent
         if (argv[1] == NULL) {
             fprintf(stderr, "cd: expected argument\n");
-        } else if (chdir(argv[1]) < 0) {
+        }
+        else if (chdir(argv[1]) != 0){
             perror("cd error");
         }
         return 1;
     }
-
-    if (!strcmp(argv[0], "exit")) {
-        exit(0);
-    }
-
-    return 0;
+    if (!strcmp(argv[0], "exit")) exit(0); //parent
+    return 0; // 빌트인 명령어 아님 
 }
 
-pid_t Fork(void) {
+pid_t Fork(void) 
+{
     pid_t pid;
     if ((pid = fork()) < 0)
-        unix_error("Fork error");
+	unix_error("Fork error");
     return pid;
 }
 
-void Execvp(const char *file, char *const argv[]) {
+void Execvp(const char *file, char *const argv[]) 
+{
     if (execvp(file, argv) < 0)
-        unix_error("Execvp error");
+	unix_error("Execvp error");
 }
 
-pid_t Waitpid(pid_t pid, int *iptr, int options) {
+pid_t Waitpid(pid_t pid, int *iptr, int options) 
+{
     pid_t retpid;
-    if ((retpid = waitpid(pid, iptr, options)) < 0)
-        unix_error("Waitpid error");
-    return retpid;
+    if ((retpid  = waitpid(pid, iptr, options)) < 0) 
+	unix_error("Waitpid error");
+    return(retpid);
+}
+
+int parseline(char *buf, char **argv){
+    int argc = 0;
+    char *p = buf;
+    buf[strcspn(buf, "\n")] = '\0';
+
+    while (*p) {
+        while (*p && isspace((unsigned char) *p)) p++;
+        if (!*p) break;
+        if(*p == '"' || *p == '\'') {
+            char quote = *p++;
+            argv[argc++] = p;
+            while (*p && *p != quote) p++;
+            if (*p == quote) *p++ = '\0';
+        } else {
+            argv[argc++] = p;
+            while (*p && !isspace((unsigned char) *p)) p++;
+            if (*p) *p++ = '\0';
+        }
+    }
+    argv[argc] = NULL;
+    return argc;
 }
 
 int Pipe(int fd[2]) {
@@ -104,132 +111,42 @@ int Pipe(int fd[2]) {
     return 0;
 }
 
-static int parse_command(char *cmd, char **argv) {
-    int argc = 0;
-    char *p = cmd;
-
-    while (*p != '\0') {
-        while (*p == ' ' || *p == '\t' || *p == '\n')
-            p++;
-
-        if (*p == '\0')
-            break;
-
-        if (*p == '"' || *p == '\'') {
-            char quote = *p;
-            p++;
-            argv[argc++] = p;
-
-            while (*p != '\0' && *p != quote)
-                p++;
-
-            if (*p == quote) {
-                *p = '\0';
-                p++;
-            }
-        } else {
-            argv[argc++] = p;
-
-            while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n')
-                p++;
-
-            if (*p != '\0') {
-                *p = '\0';
-                p++;
-            }
-        }
-
-        if (argc >= MAXARGS - 1)
-            break;
-    }
-
-    argv[argc] = NULL;
-    return argc;
-}
-
-static char *find_pipe(char *buf) {
-    char *p = buf;
-    char quote = 0;
-
-    while (*p != '\0') {
-        if (quote == 0 && (*p == '"' || *p == '\'')) {
-            quote = *p;
-        } else if (quote != 0 && *p == quote) {
-            quote = 0;
-        } else if (quote == 0 && *p == '|') {
-            return p;
-        }
-        p++;
-    }
-    return NULL;
-}
-
-static pid_t run_pipe(char *cmdline, int in_fd, pid_t *pids, int *nchild) {
-    char *pipe_pos = find_pipe(cmdline);
-    char *argv[MAXARGS];
-    pid_t pid;
-    int fd[2];
-
-    if (pipe_pos == NULL) {
-        parse_command(cmdline, argv);
-        if (argv[0] == NULL)
-            return -1;
-
-        pid = Fork();
-        if (pid == 0) {
-            if (in_fd != STDIN_FILENO) {
-                dup2(in_fd, STDIN_FILENO);
-                close(in_fd);
-            }
+void run_pipe(char **cmds, int num_cmds) {
+    if (num_cmds <= 0) return;
+    if (num_cmds == 1) {
+        char *argv[MAXARGS];
+        parseline(cmds[0], argv);
+        if (argv[0] == NULL) exit(0);
+        if (!builtin_command(argv)) {
             Execvp(argv[0], argv);
-            exit(1);
         }
-
-        pids[(*nchild)++] = pid;
-
-        if (in_fd != STDIN_FILENO)
-            close(in_fd);
-
-        return pid;
-    } 
-
-    *pipe_pos = '\0';
-    char *left = cmdline;
-    char *right = pipe_pos + 1;
-
-    while (*right == ' ' || *right == '\t')
-        right++;
-
-    parse_command(left, argv);
-    if (argv[0] == NULL) {
-        if (in_fd != STDIN_FILENO)
-            close(in_fd);
-        return run_pipe(right, STDIN_FILENO, pids, nchild);
+        exit(0);
     }
 
+    int fd[2];
     Pipe(fd);
 
-    pid = Fork();
-    if (pid == 0) {
-        if (in_fd != STDIN_FILENO) {
-            dup2(in_fd, STDIN_FILENO);
-            close(in_fd);
-        }
-
+    if(Fork() == 0){ //왼
         dup2(fd[1], STDOUT_FILENO);
         close(fd[0]);
         close(fd[1]);
-
-        Execvp(argv[0], argv);
-        exit(1);
+        char *argv[MAXARGS];
+        parseline(cmds[0], argv);
+        if (argv[0] == NULL) exit(0);
+        if (!builtin_command(argv)){
+            Execvp(argv[0], argv);
+        }
+        exit(0);
     }
-
-    pids[(*nchild)++] = pid;
-
-    if (in_fd != STDIN_FILENO)
-        close(in_fd);
-
+    if(Fork() == 0){ //오
+        dup2(fd[0], STDIN_FILENO);
+        close(fd[0]);
+        close(fd[1]);
+        run_pipe(cmds+1, num_cmds-1);
+        exit(0);
+    }
+    close(fd[0]);
     close(fd[1]);
-
-    return run_pipe(right, fd[0], pids, nchild);
+    Waitpid(-1, NULL, 0);
+    Waitpid(-1, NULL, 0);
 }
