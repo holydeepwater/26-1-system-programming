@@ -1,5 +1,5 @@
-#ifndef __CSAPP_H__
-#define __CSAPP_H__
+#ifndef __MYSHELL_H__
+#define __MYSHELL_H__
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,7 +33,7 @@
 
 void eval(char* cmdline);
 int builtin_command(char** argv);
-void unix_error(char* msg);
+void unix_error(const char* msg);
 pid_t Fork(void);
 void Execvp(const char *file, char *const argv[]);
 int parseline(char *buf, char **argv);

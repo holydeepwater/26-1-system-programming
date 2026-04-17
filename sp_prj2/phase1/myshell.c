@@ -32,7 +32,7 @@ void eval(char* cmdline){
     return;
 }
 
-void unix_error(char* msg){
+void unix_error(const char* msg){
     fprintf(stderr, "%s: %s\n", msg, strerror(errno));
 }
 
